@@ -71,6 +71,7 @@ fn run(log: Logger, options: Opt) -> Result<()> {
         .dangerous()
         .set_certificate_verifier(Arc::new(InteropVerifier(state.clone())));
     tls_config.alpn_protocols = vec![str::from_utf8(quinn::ALPN_QUIC_HTTP).unwrap().into()];
+    tls_config.enable_early_data = true;
     if options.keylog {
         tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
     }
@@ -89,6 +90,7 @@ fn run(log: Logger, options: Opt) -> Result<()> {
     let mut resumption = false;
     let mut key_update = false;
     let mut rebinding = false;
+    let mut zero_rtt = false;
     let result: Result<()> = runtime.block_on(
         Box::pin(
             async {
@@ -107,7 +109,38 @@ fn run(log: Logger, options: Opt) -> Result<()> {
                 println!("attempting resumption");
                 state.lock().unwrap().saw_cert = false;
                 let conn = endpoint.connect_with(&client_config, &remote, &options.host)?;
-                let (conn, _) = await!(conn.establish()).context("failed to connect")?;
+                let conn = match conn.into_zero_rtt() {
+                    Ok(zrtt) => {
+                        if let Some(mut stream) = zrtt.open_bi() {
+                            let n = stream.write(REQUEST).context("0-RTT limits too small")?;
+                            if n == REQUEST.len() {
+                                stream.finish().unwrap();
+                            }
+                            let conn = await!(zrtt.establish()).context("failed to connect")?.0;
+                            if let Ok(mut stream) = stream.upgrade() {
+                                if n != REQUEST.len() {
+                                    await!(stream.send.write_all(&REQUEST[n..]))
+                                        .context("writing remainder of 0-RTT request")?;
+                                    await!(stream.send.finish())
+                                        .context("finishing 0-RTT request")?;
+                                }
+                                await!(stream.recv.read_to_end(usize::max_value()))
+                                    .context("reading 0-RTT response")?;
+                                zero_rtt = true;
+                            } else {
+                                println!("0-RTT rejected");
+                            }
+                            conn
+                        } else {
+                            println!("no 0-RTT stream budget");
+                            await!(zrtt.establish()).context("failed to connect")?.0
+                        }
+                    }
+                    Err(conn) => {
+                        println!("0-RTT not offered");
+                        await!(conn.establish()).context("failed to connect")?.0
+                    }
+                };
                 resumption = !state.lock().unwrap().saw_cert;
                 println!("updating keys");
                 conn.force_key_update();
@@ -169,6 +202,9 @@ fn run(log: Logger, options: Opt) -> Result<()> {
     if resumption {
         print!("R");
     }
+    if zero_rtt {
+        print!("Z");
+    }
     if retry {
         print!("S");
     }
@@ -185,10 +221,12 @@ fn run(log: Logger, options: Opt) -> Result<()> {
 }
 
 async fn get(mut stream: quinn::BiStream) -> Result<Box<[u8]>> {
-    await!(stream.send.write_all(b"GET /index.html\r\n")).context("writing request")?;
+    await!(stream.send.write_all(REQUEST)).context("writing request")?;
     await!(stream.send.finish()).context("finishing stream")?;
     Ok(await!(stream.recv.read_to_end(usize::max_value())).context("reading response")?)
 }
+
+const REQUEST: &[u8] = b"GET /index.html\r\n";
 
 struct InteropVerifier(Arc<Mutex<State>>);
 impl rustls::ServerCertVerifier for InteropVerifier {
