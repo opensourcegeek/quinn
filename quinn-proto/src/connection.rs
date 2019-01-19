@@ -72,6 +72,7 @@ pub struct Connection {
     lost_packets: u64,
     io: IoQueue,
     events: VecDeque<Event>,
+    endpoint_events: VecDeque<EndpointEvent>,
     /// Number of local connection IDs that have been issued in NEW_CONNECTION_ID frames.
     cids_issued: u64,
     /// Outgoing spin bit state
@@ -217,6 +218,7 @@ impl Connection {
             lost_packets: 0,
             io: IoQueue::new(),
             events: VecDeque::new(),
+            endpoint_events: VecDeque::new(),
             cids_issued: 0,
             spin: false,
             spaces: [initial_space, PacketSpace::new(), PacketSpace::new()],
@@ -319,6 +321,11 @@ impl Connection {
         }
 
         None
+    }
+
+    /// Return endpoint-facing events
+    pub fn poll_endpoint_events(&mut self) -> Option<EndpointEvent> {
+        self.endpoint_events.pop_front()
     }
 
     fn on_packet_sent(&mut self, now: u64, space: SpaceId, packet_number: u64, packet: SentPacket) {
@@ -838,6 +845,9 @@ impl Connection {
         if let Some(data) = remaining {
             self.handle_coalesced(now, remote, ecn, data);
         }
+        if self.has_1rtt() {
+            self.send_ready_events();
+        }
         Ok(())
     }
 
@@ -1067,6 +1077,7 @@ impl Connection {
             remote = remote,
         );
         let was_closed = self.state.is_closed();
+        let had_1rtt = self.has_1rtt();
 
         let stateless_reset = self.params.stateless_reset_token.map_or(false, |token| {
             packet.payload.len() >= RESET_TOKEN_SIZE
@@ -1153,6 +1164,9 @@ impl Connection {
 
         if !was_closed && self.state.is_closed() {
             self.close_common(now);
+        }
+        if !had_1rtt && (self.has_1rtt() || !self.is_handshaking()) {
+            self.send_ready_events();
         }
 
         // Transmit CONNECTION_CLOSE if necessary
@@ -1281,6 +1295,7 @@ impl Connection {
                             // completes, so this would be redundant.
                             self.events.push_back(Event::Connected);
                         }
+
                         self.state = State::Established;
                         trace!(self.log, "established");
                         Ok(())
@@ -1411,6 +1426,15 @@ impl Connection {
         }
         self.write_tls();
         Ok(())
+    }
+
+    fn send_ready_events(&mut self) {
+        if self.side.is_server() {
+            self.endpoint_events.push_back(EndpointEvent::HandshakeEnded);
+        }
+        if self.config.local_cid_len != 0 && !self.state.is_closed() {
+            self.endpoint_events.push_back(EndpointEvent::IdentifiersNeeded);
+        }
     }
 
     pub fn issue_cid(&mut self, cid: ConnectionId) {
@@ -3185,6 +3209,12 @@ struct SentPacket {
 
 /// Ensures we can always fit all our ACKs in a single minimum-MTU packet with room to spare
 const MAX_ACK_BLOCKS: usize = 64;
+
+/// Events to be sent to the Endpoint
+pub enum EndpointEvent {
+    HandshakeEnded,
+    IdentifiersNeeded,
+}
 
 /// I/O operations to be immediately executed the backend.
 #[derive(Debug)]
