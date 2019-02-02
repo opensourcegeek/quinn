@@ -22,9 +22,9 @@ impl super::UdpExt for UdpSocket {
             mem::size_of::<SocketAddrV6>(),
             mem::size_of::<libc::sockaddr_in6>()
         );
-        assert_eq!(CMSG_LEN, unsafe {
-            libc::CMSG_SPACE(mem::size_of::<libc::c_int>() as _) as usize
-        });
+        assert!(
+            CMSG_LEN >= unsafe { libc::CMSG_SPACE(mem::size_of::<libc::c_int>() as _) as usize }
+        );
 
         let addr = self.local_addr()?;
 
