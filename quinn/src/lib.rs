@@ -55,7 +55,6 @@ mod builders;
 mod platform;
 pub mod tls;
 mod udp;
-pub mod zero_rtt;
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -110,11 +109,7 @@ impl Endpoint {
     ///
     /// May fail immediately due to configuration errors, or in the future if the connection could
     /// not be established.
-    pub fn connect(
-        &self,
-        addr: &SocketAddr,
-        server_name: &str,
-    ) -> Result<ClientHandshake, ConnectError> {
+    pub fn connect(&self, addr: &SocketAddr, server_name: &str) -> Result<Handshake, ConnectError> {
         self.connect_with(&self.default_client_config, addr, server_name)
     }
 
@@ -127,7 +122,7 @@ impl Endpoint {
         config: &ClientConfig,
         addr: &SocketAddr,
         server_name: &str,
-    ) -> Result<ClientHandshake, ConnectError> {
+    ) -> Result<Handshake, ConnectError> {
         let mut inner = self.inner.lock().unwrap();
         let addr = if inner.ipv6 {
             SocketAddr::V6(ensure_ipv6(addr))
@@ -146,7 +141,7 @@ impl Endpoint {
         state.connected = Some(send);
         inner.insert(ch, state);
         inner.wake();
-        Ok(ClientHandshake::new(conn, recv))
+        Ok(Handshake::new(conn, recv))
     }
 
     /// Switch to a new UDP socket
@@ -169,15 +164,15 @@ impl Endpoint {
     }
 }
 
-/// An outgoing connection that has not yet been established
-pub struct ClientHandshake {
+/// A connection that has not yet been established
+pub struct Handshake {
     conn: Connection,
     connected: oneshot::Receiver<()>,
 }
 
-impl ClientHandshake {
+impl Handshake {
     fn new(conn: Connection, connected: oneshot::Receiver<()>) -> Self {
-        Self { conn, connected }
+        Handshake { conn, connected }
     }
 
     /// Complete the handshake.
@@ -189,81 +184,55 @@ impl ClientHandshake {
         Ok((self.conn, incoming))
     }
 
-    /// Convert into a 0-RTT connection
+    /// Convert into a 0-RTT or 0.5-RTT connection at the cost of weakened security
     ///
-    /// Use with caution: 0-RTT data might be usable in a replay attack, and should therefore never
-    /// invoke non-idempotent operations.
+    /// Additionally returns a future that will yield the connection's [`IncomingStreams`] when the
+    /// connection is established.
     ///
-    /// Even if a connection succeeds, 0-RTT data might be rejected by the server due to a
-    /// configuration change. When this occurs, all streams are returned to their initial state,
-    /// therefore any application data sent in a rejected 0-RTT flight will not be automatically
-    /// retransmitted.
+    /// This is useful for reducing start-up latency by beginning transmission of application data
+    /// without waiting for the handshake's cryptographic security guarantees to be established.
+    ///
+    /// # Security
+    ///
+    /// On outgoing connections, this enables transmisison of 0-RTT data, which might be vulnerable
+    /// to replay attacks, and should therefore never invoke non-idempotent operations.
+    ///
+    /// On incoming connections, this enables transmission of 0.5-RTT data, which might be
+    /// intercepted by a man-in-the-middle. If this occurs, the handshake will not complete
+    /// successfully.
+    ///
+    /// Once [`Connection::is_handshaking`] returns false, further transmissions are unaffected by
+    /// these weaknesses.
     ///
     /// # Errors
     ///
-    /// Connections are only 0-RTT-capable when a cryptographic session ticket cached from a
-    /// previous connection to the same server is available, and includes a 0-RTT key. If no such
-    /// ticket is found, the `ClientHandshake` is returned unmodified.
-    pub fn into_zero_rtt(self) -> Result<zero_rtt::Connection, Self> {
+    /// Outgoing connections are only 0-RTT-capable when a cryptographic session ticket cached from
+    /// a previous connection to the same server is available, and includes a 0-RTT key. If no such
+    /// ticket is found, the `Handshake` is returned unmodified.
+    ///
+    /// For incoming connections, a 0.5-RTT connection will always be successfully constructed.
+    pub fn into_zero_rtt(
+        self,
+    ) -> Result<
+        (
+            Connection,
+            impl Future<Output = Result<IncomingStreams, ConnectionError>>,
+        ),
+        Self,
+    > {
         if self.conn.get(|x| x.has_0rtt()) {
-            Ok(zero_rtt::Connection::new(self.conn, self.connected))
+            let streams = IncomingStreams(self.conn.0.clone());
+            let connected = self.connected;
+            let fut = async move {
+                await!(connected).unwrap();
+                streams.0.check_err()?;
+                streams.0.inner.lock().unwrap().check_err()?;
+                Ok(streams)
+            };
+            Ok((self.conn, fut))
         } else {
             Err(self)
         }
-    }
-
-    /// The peer's UDP address.
-    pub fn remote_address(&self) -> SocketAddr {
-        self.conn.remote_address()
-    }
-}
-
-/// An outgoing connection that has not yet been established
-pub struct ServerHandshake {
-    conn: Connection,
-    /// If None, already connected
-    connected: Option<oneshot::Receiver<()>>,
-}
-
-impl ServerHandshake {
-    fn new(conn: Connection) -> Self {
-        Self {
-            conn,
-            connected: None,
-        }
-    }
-
-    /// Complete the handshake.
-    pub async fn establish(self) -> Result<(Connection, IncomingStreams), ConnectionError> {
-        let (conn, incoming) = self.into_half_rtt();
-        let incoming = await!(incoming)?;
-        Ok((conn, incoming))
-    }
-
-    /// Convert into a [`Connection`] that can send 0.5-RTT data.
-    ///
-    /// Use with caution: 0.5-RTT data is sent before the absence of a man-in-the-middle attacker
-    /// has been confirmed.
-    ///
-    /// Additionally returns future that will yield the connection's [`IncomingStreams`] when the
-    /// connection is established.
-    pub fn into_half_rtt(
-        self,
-    ) -> (
-        Connection,
-        impl Future<Output = Result<IncomingStreams, ConnectionError>>,
-    ) {
-        let ServerHandshake { conn, connected } = self;
-        let incoming = IncomingStreams(conn.0.clone());
-        let fut = async move {
-            if let Some(connected) = connected {
-                await!(connected).unwrap();
-            }
-            incoming.0.check_err()?;
-            incoming.0.inner.lock().unwrap().check_err()?;
-            Ok(incoming)
-        };
-        (conn, fut)
     }
 
     /// The peer's UDP address.
@@ -635,23 +604,24 @@ impl Connection {
 
     /// Initite a new outgoing unidirectional stream.
     pub async fn open_uni(&self) -> Result<SendStream, ConnectionError> {
-        let id = await!(self.open_inner(Directionality::Uni))?;
-        Ok(SendStream::new(self.0.clone(), id))
+        let (id, is_0rtt) = await!(self.open_inner(Directionality::Uni))?;
+        Ok(SendStream::new(self.0.clone(), id, is_0rtt))
     }
 
     /// Initiate a new outgoing bidirectional stream.
     pub async fn open_bi(&self) -> Result<BiStream, ConnectionError> {
-        let id = await!(self.open_inner(Directionality::Bi))?;
-        Ok(BiStream::new(self.0.clone(), id))
+        let (id, is_0rtt) = await!(self.open_inner(Directionality::Bi))?;
+        Ok(BiStream::new(self.0.clone(), id, is_0rtt))
     }
 
-    async fn open_inner(&self, dir: Directionality) -> Result<StreamId, ConnectionError> {
+    async fn open_inner(&self, dir: Directionality) -> Result<(StreamId, bool), ConnectionError> {
         await!(future::poll_fn(move |waker| {
             self.0.check_err()?;
             let inner = &mut *self.0.inner.lock().unwrap();
             inner.check_err()?;
             if let Some(id) = inner.endpoint.open(self.0.ch, dir) {
-                Poll::Ready(Ok(id))
+                let is_0rtt = inner.endpoint.connection(self.0.ch).is_handshaking();
+                Poll::Ready(Ok((id, is_0rtt)))
             } else {
                 let conn = inner.conns[self.0.ch.0].as_mut().unwrap();
                 let wakers = match dir {
@@ -713,6 +683,11 @@ impl Connection {
     /// The negotiated application protocol
     pub fn protocol(&self) -> Option<Box<[u8]>> {
         self.get(|x| x.protocol().map(|x| x.to_vec().into()))
+    }
+
+    /// Whether a 0-RTT or 0.5-RTT has not yet become 1-RTT
+    pub fn is_handshaking(&self) -> bool {
+        self.get(|x| x.is_handshaking())
     }
 
     // Update traffic keys spontaneously for testing purposes.
@@ -786,11 +761,11 @@ pub struct BiStream {
 }
 
 impl BiStream {
-    fn new(conn: Arc<ConnInner>, id: StreamId) -> Self {
+    fn new(conn: Arc<ConnInner>, id: StreamId, is_0rtt: bool) -> Self {
         debug_assert_eq!(id.directionality(), Directionality::Bi);
         Self {
-            send: SendStream::new(conn.clone(), id),
-            recv: RecvStream::new(conn, id),
+            send: SendStream::new(conn.clone(), id, is_0rtt),
+            recv: RecvStream::new(conn, id, is_0rtt),
         }
     }
 }
@@ -801,15 +776,18 @@ pub struct SendStream {
     id: StreamId,
     finishing: bool,
     closed: bool,
+    /// Whether this stream was constructed before the handshake completed
+    is_0rtt: bool,
 }
 
 impl SendStream {
-    fn new(conn: Arc<ConnInner>, id: StreamId) -> Self {
+    fn new(conn: Arc<ConnInner>, id: StreamId, is_0rtt: bool) -> Self {
         Self {
             conn,
             id,
             finishing: false,
             closed: false,
+            is_0rtt,
         }
     }
 
@@ -819,6 +797,9 @@ impl SendStream {
             .map_err(WriteError::ConnectionClosed)?;
         let inner = &mut *self.conn.inner.lock().unwrap();
         inner.check_err().map_err(WriteError::ConnectionClosed)?;
+        if self.is_0rtt {
+            check_0rtt(&inner.endpoint, self.conn.ch).map_err(|()| WriteError::ZeroRttRejected)?;
+        }
         use crate::quinn::WriteError::*;
         match inner.endpoint.write(self.conn.ch, self.id, buf) {
             Ok(n) => {
@@ -856,12 +837,14 @@ impl SendStream {
     ///
     /// No new data may be written after calling this method. Completes when the peer has
     /// acknowledged all sent data, retransmitting data as needed.
-    pub async fn finish(&mut self) -> Result<(), ConnectionError> {
+    pub async fn finish(&mut self) -> Result<(), FinishError> {
         self.start_finish()?;
-        await!(future::poll_fn(move |waker| self.poll_finish(waker)))
+        Ok(await!(future::poll_fn(
+            move |waker| self.poll_finish(waker)
+        ))?)
     }
 
-    fn start_finish(&mut self) -> Result<(), ConnectionError> {
+    fn start_finish(&mut self) -> Result<(), FinishError> {
         self.finishing = true;
         if self.closed {
             return Ok(());
@@ -870,15 +853,22 @@ impl SendStream {
         {
             let inner = &mut *self.conn.inner.lock().unwrap();
             inner.check_err()?;
+            if self.is_0rtt {
+                check_0rtt(&inner.endpoint, self.conn.ch)
+                    .map_err(|()| FinishError::ZeroRttRejected)?;
+            }
             inner.endpoint.finish(self.conn.ch, self.id);
         }
         Ok(())
     }
 
-    fn poll_finish(&mut self, lw: &LocalWaker) -> Poll<Result<(), ConnectionError>> {
+    fn poll_finish(&mut self, lw: &LocalWaker) -> Poll<Result<(), FinishError>> {
         self.conn.check_err()?;
         let inner = &mut *self.conn.inner.lock().unwrap();
         inner.check_err()?;
+        if self.is_0rtt {
+            check_0rtt(&inner.endpoint, self.conn.ch).map_err(|()| FinishError::ZeroRttRejected)?;
+        }
         let conn = inner.conns[self.conn.ch.0].as_mut().unwrap();
         if conn.finished.remove(&self.id) {
             inner.wake();
@@ -905,6 +895,9 @@ impl SendStream {
         }
         let inner = &mut *self.conn.inner.lock().unwrap();
         if inner.check_err().is_err() {
+            return;
+        }
+        if self.is_0rtt && check_0rtt(&inner.endpoint, self.conn.ch).is_err() {
             return;
         }
         inner.endpoint.reset(self.conn.ch, self.id, error_code);
@@ -947,6 +940,11 @@ pub enum WriteError {
     /// The connection was closed.
     #[error(display = "connection closed: {}", _0)]
     ConnectionClosed(ConnectionError),
+    /// This was a 0-RTT stream and the server rejected it.
+    ///
+    /// Can only occur on clients, for streams initiated before the handshake completes.
+    #[error(display = "0-RTT rejected")]
+    ZeroRttRejected,
 }
 
 impl From<WriteError> for io::Error {
@@ -958,6 +956,36 @@ impl From<WriteError> for io::Error {
                 format!("stream stopped by peer: error {}", error_code),
             ),
             ConnectionClosed(e) => e.into(),
+            ZeroRttRejected => io::Error::new(io::ErrorKind::ConnectionReset, "0-RTT rejected"),
+        }
+    }
+}
+
+/// Errors that arise from finishing a stream
+#[derive(Debug, Error, Clone)]
+pub enum FinishError {
+    /// The connection was closed.
+    #[error(display = "connection closed: {}", _0)]
+    ConnectionClosed(ConnectionError),
+    /// This was a 0-RTT stream and the server rejected it.
+    ///
+    /// Can only occur on clients, for streams initiated before the handshake completes.
+    #[error(display = "0-RTT rejected")]
+    ZeroRttRejected,
+}
+
+impl From<ConnectionError> for FinishError {
+    fn from(x: ConnectionError) -> Self {
+        FinishError::ConnectionClosed(x)
+    }
+}
+
+impl From<FinishError> for io::Error {
+    fn from(x: FinishError) -> Self {
+        use self::FinishError::*;
+        match x {
+            ConnectionClosed(e) => e.into(),
+            ZeroRttRejected => io::Error::new(io::ErrorKind::ConnectionReset, "0-RTT rejected"),
         }
     }
 }
@@ -967,14 +995,17 @@ pub struct RecvStream {
     conn: Arc<ConnInner>,
     id: StreamId,
     closed: bool,
+    /// Whether this stream was constructed before the handshake completed
+    is_0rtt: bool,
 }
 
 impl RecvStream {
-    fn new(conn: Arc<ConnInner>, id: StreamId) -> Self {
+    fn new(conn: Arc<ConnInner>, id: StreamId, is_0rtt: bool) -> Self {
         Self {
             conn,
             id,
             closed: false,
+            is_0rtt,
         }
     }
 
@@ -982,6 +1013,9 @@ impl RecvStream {
         self.conn.check_err().map_err(ReadError::ConnectionClosed)?;
         let inner = &mut *self.conn.inner.lock().unwrap();
         inner.check_err().map_err(ReadError::ConnectionClosed)?;
+        if self.is_0rtt {
+            check_0rtt(&inner.endpoint, self.conn.ch).map_err(|()| ReadError::ZeroRttRejected)?;
+        }
         use crate::quinn::ReadError::*;
         match inner.endpoint.read(self.conn.ch, self.id, buf) {
             Ok(n) => {
@@ -1030,6 +1064,10 @@ impl RecvStream {
             self.conn.check_err().map_err(ReadError::ConnectionClosed)?;
             let inner = &mut *self.conn.inner.lock().unwrap();
             inner.check_err().map_err(ReadError::ConnectionClosed)?;
+            if self.is_0rtt {
+                check_0rtt(&inner.endpoint, self.conn.ch)
+                    .map_err(|()| ReadError::ZeroRttRejected)?;
+            }
             use crate::quinn::ReadError::*;
             match inner.endpoint.read_unordered(self.conn.ch, self.id) {
                 Ok(x) => {
@@ -1072,6 +1110,9 @@ impl RecvStream {
         }
         let inner = &mut *self.conn.inner.lock().unwrap();
         if inner.check_err().is_err() {
+            return;
+        }
+        if self.is_0rtt && check_0rtt(&inner.endpoint, self.conn.ch).is_err() {
             return;
         }
         inner
@@ -1131,6 +1172,12 @@ pub enum ReadError {
     /// The connection was closed.
     #[error(display = "connection closed: {}", _0)]
     ConnectionClosed(ConnectionError),
+    /// This was a 0-RTT stream and the server rejected it.
+    ///
+    /// Can only occur on streams opened before handshake completion by clients that used
+    /// [`ClientHandshake::into_zero_rtt`]
+    #[error(display = "0-RTT rejected")]
+    ZeroRttRejected,
 }
 
 impl From<ReadError> for io::Error {
@@ -1143,15 +1190,24 @@ impl From<ReadError> for io::Error {
                 format!("stream reset by peer: error {}", error_code),
             ),
             Finished => io::Error::new(io::ErrorKind::UnexpectedEof, "stream finished"),
+            ZeroRttRejected => io::Error::new(io::ErrorKind::ConnectionReset, "0-RTT rejected"),
         }
     }
+}
+
+fn check_0rtt(endpoint: &quinn::Endpoint, ch: ConnectionHandle) -> Result<(), ()> {
+    let conn = endpoint.connection(ch);
+    if conn.is_handshaking() || conn.accepted_0rtt() {
+        return Ok(());
+    }
+    Err(())
 }
 
 /// Connections initiated by remote clients
 pub struct IncomingConnections(Arc<Mutex<EndpointInner>>);
 
 impl Stream for IncomingConnections {
-    type Item = ServerHandshake;
+    type Item = Handshake;
     fn poll_next(mut self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Option<Self::Item>> {
         let inner = &mut *self.0.lock().unwrap();
         if inner.check_err().is_err() {
@@ -1160,11 +1216,12 @@ impl Stream for IncomingConnections {
         if let Some(conn) = inner.incoming.pop_front() {
             inner.endpoint.accept();
             let ch = conn.0.ch;
-            let mut hs = ServerHandshake::new(conn);
+            let (send, recv) = oneshot::channel();
+            let hs = Handshake::new(conn, recv);
             if inner.endpoint.connection(ch).is_handshaking() {
-                let (send, recv) = oneshot::channel();
                 inner.conns[ch.0].as_mut().unwrap().connected = Some(send);
-                hs.connected = Some(recv);
+            } else {
+                send.send(()).unwrap();
             }
             return Poll::Ready(Some(hs));
         }
@@ -1189,10 +1246,10 @@ impl Stream for IncomingStreams {
         }
         let conn = inner.conns[cloned.ch.0].as_mut().unwrap();
         if let Some(id) = inner.endpoint.accept_stream(cloned.ch) {
-            let recv = RecvStream::new(cloned.clone(), id);
+            let recv = RecvStream::new(cloned.clone(), id, false);
             return Poll::Ready(Some(match id.directionality() {
                 Directionality::Bi => NewStream::Bi(BiStream {
-                    send: SendStream::new(cloned, id),
+                    send: SendStream::new(cloned, id, false),
                     recv,
                 }),
                 Directionality::Uni => NewStream::Uni(recv),

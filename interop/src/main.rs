@@ -110,31 +110,17 @@ fn run(log: Logger, options: Opt) -> Result<()> {
                 state.lock().unwrap().saw_cert = false;
                 let conn = endpoint.connect_with(&client_config, &remote, &options.host)?;
                 let conn = match conn.into_zero_rtt() {
-                    Ok(zrtt) => {
-                        if let Some(mut stream) = zrtt.open_bi() {
-                            let n = stream.write(REQUEST).context("0-RTT limits too small")?;
-                            if n == REQUEST.len() {
-                                stream.finish().unwrap();
-                            }
-                            let conn = await!(zrtt.establish()).context("failed to connect")?.0;
-                            if let Ok(mut stream) = stream.upgrade() {
-                                if n != REQUEST.len() {
-                                    await!(stream.send.write_all(&REQUEST[n..]))
-                                        .context("writing remainder of 0-RTT request")?;
-                                    await!(stream.send.finish())
-                                        .context("finishing 0-RTT request")?;
-                                }
-                                await!(stream.recv.read_to_end(usize::max_value()))
-                                    .context("reading 0-RTT response")?;
-                                zero_rtt = true;
-                            } else {
-                                println!("0-RTT rejected");
-                            }
-                            conn
+                    Ok((conn, _)) => {
+                        let stream =
+                            await!(conn.open_bi()).context("failed to open 0-RTT stream")?;
+                        if !conn.is_handshaking() {
+                            println!("0-RTT stream budget too low");
+                        } else if let Err(e) = await!(get(stream)) {
+                            println!("0-RTT failed: {}", e);
                         } else {
-                            println!("no 0-RTT stream budget");
-                            await!(zrtt.establish()).context("failed to connect")?.0
+                            zero_rtt = true;
                         }
+                        conn
                     }
                     Err(conn) => {
                         println!("0-RTT not offered");
