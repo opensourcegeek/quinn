@@ -7,10 +7,10 @@ use futures::TryFutureExt;
 use structopt::StructOpt;
 use tokio::runtime::current_thread::Runtime;
 
-use failure::{format_err, Error, ResultExt};
+use err_ctx::ResultExt;
 use slog::{o, warn, Drain, Logger};
 
-type Result<T> = std::result::Result<T, Error>;
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "interop")]
@@ -52,7 +52,7 @@ fn run(log: Logger, options: Opt) -> Result<()> {
     let remote = format!("{}:{}", options.host, options.port)
         .to_socket_addrs()?
         .next()
-        .ok_or(format_err!("couldn't resolve to an address"))?;
+        .ok_or("couldn't resolve to an address")?;
     let host = if webpki::DNSNameRef::try_from_ascii_str(&options.host).is_ok() {
         &options.host
     } else {
@@ -95,12 +95,12 @@ fn run(log: Logger, options: Opt) -> Result<()> {
         Box::pin(
             async {
                 let conn = endpoint.connect_with(&client_config, &remote, host)?;
-                let (conn, _) = await!(conn.establish()).context("failed to connect")?;
+                let (conn, _) = await!(conn.establish()).ctx("failed to connect")?;
                 println!("connected");
                 assert!(state.lock().unwrap().saw_cert);
                 handshake = true;
-                let stream = await!(conn.open_bi()).context("failed to open stream")?;
-                let data = await!(get(stream)).context("request failed")?;
+                let stream = await!(conn.open_bi()).ctx("failed to open stream")?;
+                let data = await!(get(stream)).ctx("request failed")?;
                 println!("read {} bytes, closing", data.len());
                 stream_data = true;
                 await!(conn.close(0, b"done"));
@@ -111,8 +111,7 @@ fn run(log: Logger, options: Opt) -> Result<()> {
                 let conn = endpoint.connect_with(&client_config, &remote, &options.host)?;
                 let conn = match conn.into_zero_rtt() {
                     Ok((conn, _)) => {
-                        let stream =
-                            await!(conn.open_bi()).context("failed to open 0-RTT stream")?;
+                        let stream = await!(conn.open_bi()).ctx("failed to open 0-RTT stream")?;
                         if !conn.is_handshaking() {
                             println!("0-RTT stream budget too low");
                         } else if let Err(e) = await!(get(stream)) {
@@ -124,14 +123,14 @@ fn run(log: Logger, options: Opt) -> Result<()> {
                     }
                     Err(conn) => {
                         println!("0-RTT not offered");
-                        await!(conn.establish()).context("failed to connect")?.0
+                        await!(conn.establish()).ctx("failed to connect")?.0
                     }
                 };
                 resumption = !state.lock().unwrap().saw_cert;
                 println!("updating keys");
                 conn.force_key_update();
-                let stream = await!(conn.open_bi()).context("failed to open stream")?;
-                await!(get(stream)).context("request failed")?;
+                let stream = await!(conn.open_bi()).ctx("failed to open stream")?;
+                await!(get(stream)).ctx("request failed")?;
                 key_update = true;
                 let socket = std::net::UdpSocket::bind("[::]:0").unwrap();
                 let addr = socket.local_addr().unwrap();
@@ -139,8 +138,8 @@ fn run(log: Logger, options: Opt) -> Result<()> {
                 endpoint
                     .rebind(socket, &tokio_reactor::Handle::default())
                     .expect("rebind failed");
-                let stream = await!(conn.open_bi()).context("failed to open stream")?;
-                await!(get(stream)).context("request failed")?;
+                let stream = await!(conn.open_bi()).ctx("failed to open stream")?;
+                await!(get(stream)).ctx("request failed")?;
                 rebinding = true;
                 await!(conn.close(0, b"done"));
                 Ok(())
@@ -158,12 +157,12 @@ fn run(log: Logger, options: Opt) -> Result<()> {
         let remote = format!("{}:{}", options.host, options.retry_port)
             .to_socket_addrs()?
             .next()
-            .ok_or(format_err!("couldn't resolve to an address"))?;
+            .ok_or("couldn't resolve to an address")?;
         let result: Result<()> = runtime.block_on(
             Box::pin(
                 async {
                     let conn = endpoint.connect_with(&client_config, &remote, host)?;
-                    let (conn, _) = await!(conn.establish()).context("failed to connect")?;
+                    let (conn, _) = await!(conn.establish()).ctx("failed to connect")?;
                     retry = true;
                     await!(conn.close(0, b"done"));
                     Ok(())
@@ -207,9 +206,9 @@ fn run(log: Logger, options: Opt) -> Result<()> {
 }
 
 async fn get(mut stream: quinn::BiStream) -> Result<Box<[u8]>> {
-    await!(stream.send.write_all(REQUEST)).context("writing request")?;
-    await!(stream.send.finish()).context("finishing stream")?;
-    Ok(await!(stream.recv.read_to_end(usize::max_value())).context("reading response")?)
+    await!(stream.send.write_all(REQUEST)).ctx("writing request")?;
+    await!(stream.send.finish()).ctx("finishing stream")?;
+    Ok(await!(stream.recv.read_to_end(usize::max_value())).ctx("reading response")?)
 }
 
 const REQUEST: &[u8] = b"GET /index.html\r\n";
